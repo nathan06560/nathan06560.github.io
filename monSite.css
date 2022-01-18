@@ -1,0 +1,124 @@
+body {
+  background-color: grey ;
+  text-align: center;
+  }
+
+  .separateur {
+  	clear: both;
+  	height: 30px;
+  }
+
+  a:link {
+    color: #CCCCCC;
+  }
+
+  a:hover {
+    color: #DDDDDD;
+  }
+
+  a:active {
+    color: black;
+  }
+
+  a:visited {
+    color: black;
+  }
+
+ul {
+  list-style-type: none;
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  background-color: #333333;
+}
+
+li {
+  float: left;
+
+}
+
+li a {
+
+  display: block;
+  color: white;
+  text-align: center;
+  padding: 16px;
+  text-decoration: none;
+}
+
+li a:hover {
+  background-color: #444444;
+}
+
+table, th, td {
+  border:1px solid black;
+}
+
+center p {
+  text-align: center;
+  color: grey;
+}
+
+#animationDa-uzi {
+  width: 360px;
+  overflow: auto;
+  margin: auto;
+  float: left;
+}
+
+.imagesDa-uzi {
+  display: flex;
+  animation-duration: 10s;
+  animation-name: defilement1;
+  animation-iteration-count: infinite;
+}
+
+@keyframes defilement1 {
+  0% {transform: translateX(0);}
+  25% {transform: translateX(-360px);}
+  50% {transform: translateX(-720px);}
+  75% {transform: translateX(-1080px);}
+  100% {transform: translateX(0);}
+}
+
+.imagesMaes {
+  display: flex;
+  animation-duration: 10s;
+  animation-name: defilement2;
+  animation-iteration-count: infinite;
+}
+
+#animationMaes {
+  width: 200px;
+  overflow: auto;
+  float: left;
+}
+
+@keyframes defilement2 {
+  0% {transform: translateX(0);}
+  25% {transform: translateX(-201px);}
+  50% {transform: translateX(-402px);}
+  75% {transform: translateX(-603px);}
+  100% {transform: translateX(0);}
+}
+
+.imagesSCH {
+  display: flex;
+  animation-duration: 10s;
+  animation-name: defilement3;
+  animation-iteration-count: infinite;
+}
+
+#animationSCH {
+  overflow: auto;
+  width: 340px;
+  float: left;
+}
+
+@keyframes defilement3 {
+  0% {transform: translateX(0);}
+  25% {transform: translateX(-340px);}
+  50% {transform: translateX(-680px);}
+  75% {transform: translateX(-1020px);}
+  100% {transform: translateX(0);}
+}
