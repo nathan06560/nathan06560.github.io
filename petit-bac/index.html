@@ -147,7 +147,8 @@ a{color:var(--accent2)}
       <li>Une lettre est tirée au hasard.</li>
       <li>Trouve un mot qui commence par cette lettre pour chaque catégorie.</li>
       <li>Quand tu as tout rempli, appuie sur <b>STOP</b> : les autres ont quelques secondes pour finir.</li>
-      <li>Mot unique : <b style="color:var(--ok)">10 pts</b> · Même mot qu'un autre : <b style="color:var(--dup)">5 pts</b> · Vide ou refusé : <b style="color:var(--bad)">0</b>.</li>
+      <li>Mot unique : <b style="color:var(--ok)">10 pts</b> · Même mot qu'un autre : <b style="color:var(--dup)">5 pts</b> · Vide, refusé ou une seule lettre : <b style="color:var(--bad)">0</b>.</li>
+      <li>Un mot doit faire au moins 2 lettres pour compter.</li>
       <li>Personne n'est obligé de rester sur la page : si l'hôte s'en va, un autre joueur prend le relais.</li>
       <li>Pendant la correction, touche un mot pour le contester. Refusé si la majorité des autres joueurs le conteste.</li>
     </ul>
@@ -326,7 +327,7 @@ function canon(s){ // pour détecter les doublons : sans article, sans pluriel
 }
 function startsOk(word, letter){
   const n = norm(word).replace(/^[' -]+/, '');
-  if (!n) return false;
+  if (n.replace(/[^a-z0-9]/g, '').length < 2) return false; // au moins 2 lettres
   const L = letter.toLowerCase();
   if (n[0] === L) return true;
   // accepte "le Lion" / "l'ours" uniquement si le mot sans article commence aussi par la lettre
