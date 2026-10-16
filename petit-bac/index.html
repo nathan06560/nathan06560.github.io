@@ -112,7 +112,7 @@ a{color:var(--accent2)}
 
   <div id="resume-card" class="card hidden">
     <h2>Partie en cours</h2>
-    <p class="muted">Vous étiez l'hôte de la partie <b id="resume-code"></b>.</p>
+    <p class="muted">Tu étais dans la partie <b id="resume-code"></b>.</p>
     <div class="row" style="margin-top:10px">
       <button class="btn primary" id="btn-resume">Reprendre</button>
       <button class="btn" id="btn-forget">Oublier</button>
@@ -146,6 +146,7 @@ a{color:var(--accent2)}
       <li>Trouve un mot qui commence par cette lettre pour chaque catégorie.</li>
       <li>Quand tu as tout rempli, appuie sur <b>STOP</b> : les autres ont quelques secondes pour finir.</li>
       <li>Mot unique : <b style="color:var(--ok)">10 pts</b> · Même mot qu'un autre : <b style="color:var(--dup)">5 pts</b> · Vide ou refusé : <b style="color:var(--bad)">0</b>.</li>
+      <li>Si l'hôte s'en va, un autre joueur prend le relais automatiquement.</li>
       <li>Pendant la correction, touche un mot pour le contester. Refusé si la majorité des autres joueurs le conteste.</li>
     </ul>
   </div>
@@ -287,8 +288,6 @@ a{color:var(--accent2)}
 <div id="toast" class="toast hidden"></div>
 <div id="netbar" class="netbar hidden"></div>
 
-<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
-<script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js"><\/script>')</script>
 <script>
 "use strict";
 /* ================= Utilitaires ================= */
@@ -340,374 +339,110 @@ function shuffle(a){ a = a.slice(); for (let i = a.length - 1; i > 0; i--){ cons
 function initials(n){ return esc((n || '?').trim().charAt(0).toUpperCase()); }
 function vibrate(p){ try{ navigator.vibrate && navigator.vibrate(p); }catch(e){} }
 
-/* ================= Réseau (relais MQTT public, aucun serveur à gérer) ================= */
-// Tout le monde se connecte aux mêmes relais ; chaque message est envoyé sur tous les relais
-// connectés et dédoublonné à la réception, pour que ça marche même si un relais est bloqué.
-const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-const TOPIC = 'petitbac-n06560/v2/';
+/* ================= Réseau (serveur Vercel + base de données Redis) ================= */
+// Le serveur garde la partie : personne n'a besoin de laisser sa page ouverte.
+const API = (location.hostname.endsWith('github.io') ? 'https://nathan06560-github-io.vercel.app' : '') + '/api/petitbac';
 let isHost = false, roomCode = null;
-let S = null;            // état partagé (l'hôte fait autorité)
-let H = null;            // données privées de l'hôte (réponses pendant la manche)
-let clockOffset = 0;     // Date.now() local - Date.now() hôte
+let S = null;            // état de la partie (vient du serveur)
+let seen = {};           // dernière activité de chaque joueur (heure serveur)
+let clockOffset = 0;     // Date.now() local - heure serveur
 let myAnswers = {}, myRound = -1, myAnswersRound = -1;
-let netClients = [], seenIds = new Set(), lastV = -1, lastLive = 0;
-const lastSeen = new Map();
-let hostTick = null, collectTimer = null, joinTimeout = null, clientTick = null;
-let leaving = false;
-const rid = () => Math.random().toString(36).slice(2, 12);
-
-function netOpen(code, subs, onMsg){
-  netClose();
-  const base = TOPIC + code + '/';
-  netClients = BROKERS.map(url => {
-    const c = mqtt.connect(url, { clientId: 'pb_' + rid(), clean: true, connectTimeout: 10000, reconnectPeriod: 2000, keepalive: 30 });
-    c.on('connect', () => { c.subscribe(subs.map(s => base + s), { qos: 0 }); updateNetbar(); });
-    c.on('message', (topic, payload, packet) => {
-      let m; try{ m = JSON.parse(payload.toString()); }catch(e){ return; }
-      if (!m || typeof m !== 'object' || !m.id || seenIds.has(m.id)) return;
-      seenIds.add(m.id); if (seenIds.size > 3000) seenIds = new Set([...seenIds].slice(-1000));
-      onMsg(topic.slice(base.length), m, !!packet.retain);
-    });
-    ['close', 'offline'].forEach(ev => c.on(ev, updateNetbar));
-    c.on('error', () => {});
-    return c;
-  });
-}
-function netPub(sub, obj, retain){
-  const t = TOPIC + roomCode + '/' + sub, payload = obj == null ? '' : JSON.stringify(obj);
-  netClients.forEach(c => { if (c.connected) try{ c.publish(t, payload, { qos: 0, retain: !!retain }); }catch(e){} });
-}
-function netConnected(){ return netClients.some(c => c.connected); }
-function netClose(){ const old = netClients; netClients = []; old.forEach(c => { try{ c.end(true); }catch(e){} }); }
-function netReady(cb, timeoutMs, onFail){
-  const t0 = Date.now();
-  const iv = setInterval(() => {
-    if (leaving){ clearInterval(iv); return; }
-    if (netConnected()){ clearInterval(iv); cb(); }
-    else if (Date.now() - t0 > timeoutMs){ clearInterval(iv); onFail(); }
-  }, 150);
-}
-function updateNetbar(){
-  const bar = $('#netbar'); if (!bar) return;
-  let msg = '';
-  if (S && netClients.length && !netConnected()) msg = 'Connexion perdue… reconnexion en cours';
-  else if (S && !isHost && lastLive && Date.now() - lastLive > 15000) msg = "L'hôte ne répond plus (il doit garder la page du jeu ouverte)";
-  bar.textContent = msg; bar.classList.toggle('hidden', !msg);
-}
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') netClients.forEach(c => { if (!c.connected) try{ c.reconnect(); }catch(e){} });
-});
+let pollTimer = null, pollCount = 0, failCount = 0, leaving = false, storageWarned = false;
 
 function myName(){ return ($('#in-name').value || '').trim().slice(0, 16); }
+function online(uid){ return Date.now() - clockOffset - (+seen[uid] || 0) < 15000; }
 
-/* ================= HÔTE ================= */
-function newState(code){
-  return {
-    code, phase: 'lobby', round: 0, letter: '', usedLetters: [], endsAt: 0, stoppedBy: null,
-    players: [], banned: [],
-    settings: { categories: CLASSIC.slice(), duration: 120, rounds: 5, stopDelay: 10, letters: 'easy' },
-    answers: null, votes: {}, result: null, doneCount: 0
-  };
+async function api(action, data, quiet){
+  const body = Object.assign({ action, uid: MY_UID, code: roomCode }, data || {});
+  let r, j;
+  try{
+    r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    j = await r.json();
+  }catch(e){
+    failCount++; updateNetbar();
+    if (!quiet) toast('Impossible de joindre le serveur du jeu. Vérifie ta connexion.');
+    throw e;
+  }
+  failCount = 0; updateNetbar();
+  if (j.now) clockOffset = Date.now() - j.now;
+  if (j.storage === 'memory' && !storageWarned && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)){
+    storageWarned = true; toast('⚠️ La base de données n\'est pas encore connectée sur Vercel', 7000);
+  }
+  if (j.seen) seen = j.seen;
+  if (!r.ok){ const err = new Error(j.error || 'Erreur'); err.status = r.status; if (!quiet) toast(err.message); throw err; }
+  if (j.state) applyState(j.state);
+  else if (j.seen && S) render();
+  return j;
 }
-function randomCode(){ let c = ''; for (let i = 0; i < 4; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]; return c; }
+function applyState(s){
+  if (S && s.code === S.code && s.v < S.v) return; // réponse en retard
+  const prev = S ? S.phase : null, wasHost = isHost;
+  S = s; roomCode = s.code;
+  isHost = S.hostUid === MY_UID;
+  if (!S.players.some(p => p.uid === MY_UID)){ toast('Tu ne fais plus partie de cette partie'); goHome(false, true); return; }
+  if (prev && !wasHost && isHost) toast('Tu es maintenant l\'hôte de la partie');
+  store.set('pb_room', { code: S.code, t: Date.now() });
+  if (S.phase === 'collecting' && prev !== 'collecting') sendAnswers(true);
+  render();
+}
+function schedulePoll(ms){ clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
+async function poll(){
+  if (leaving || !roomCode) return;
+  const fast = S && ['rolling', 'playing', 'collecting'].includes(S.phase);
+  pollCount++;
+  const beat = pollCount % (fast ? 4 : 3) === 1;
+  const now = Date.now() - clockOffset;
+  const due = S && ((S.phase === 'rolling' && now >= S.rollUntil) || (S.phase === 'playing' && S.endsAt && now >= S.endsAt) || S.phase === 'collecting');
+  try{ await api('poll', { v: S ? S.v : 0, beat, host: S ? S.hostUid : undefined, phase: due ? S.phase : undefined }, true); }
+  catch(e){ if (e.status === 404){ toast('Cette partie est terminée ou a expiré'); goHome(false, true); return; } }
+  if (!leaving && roomCode) schedulePoll(document.hidden ? 4000 : fast ? 1000 : 1500);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && roomCode) schedulePoll(0); });
+function updateNetbar(){
+  const bar = $('#netbar'); if (!bar) return;
+  const msg = S && failCount >= 2 ? 'Connexion au serveur perdue… nouvel essai' : '';
+  bar.textContent = msg; bar.classList.toggle('hidden', !msg);
+}
 
-function hostStart(resumeData){
+async function createGame(){
   const name = myName();
   if (!name){ toast('Choisis un pseudo d\'abord'); $('#in-name').focus(); return; }
   store.set('pb_name', name);
-  isHost = true; leaving = false;
-  if (resumeData){
-    S = resumeData.S; H = resumeData.H || { answers: {}, done: [] };
-    S.players.forEach(p => p.connected = (p.uid === MY_UID));
-    myAnswers = (H.answers && H.answers[MY_UID]) || {}; myAnswersRound = S.round;
-    if (S.phase === 'rolling'){ S.phase = 'playing'; S.endsAt = S.settings.duration ? Date.now() + S.settings.duration * 1000 : 0; }
-    if (S.phase === 'collecting') { S.phase = 'playing'; S.endsAt = Date.now(); }
-  } else {
-    S = newState(randomCode()); H = { answers: {}, done: [] };
-  }
-  roomCode = S.code;
-  addOrUpdatePlayer(MY_UID, name, true);
-  openHostNet(!resumeData);
-}
-
-function openHostNet(fresh){
+  leaving = false; S = null; roomCode = null;
   show('scr-connecting'); $('#connecting-msg').textContent = 'Création de la partie…';
-  if (typeof mqtt === 'undefined'){ toast('Impossible de charger le module réseau. Vérifie ta connexion.'); goHome(false); return; }
-  let checking = true, taken = false;
-  roomCode = S.code;
-  netOpen(S.code, ['up', 'state'], (sub, m, retained) => {
-    if (sub === 'state'){
-      // une autre partie active utilise déjà ce code ?
-      if (checking && m.host !== MY_UID && m.s && m.s.phase !== 'end' && Date.now() - m.now < 3 * 3600e3) taken = true;
-      return;
-    }
-    if (sub === 'up' && !checking) hostOnMsg(m);
-  });
-  netReady(() => setTimeout(() => {
-    if (leaving) return;
-    if (taken && fresh){ S.code = randomCode(); openHostNet(true); return; }
-    checking = false;
-    hostTick = hostTick || setInterval(hostLoop, 250);
-    broadcast();
-  }, 1200), 15000, () => { toast('Impossible de se connecter au serveur de jeu. Vérifie ta connexion internet.'); goHome(false); });
+  try{ await api('create', { name }); schedulePoll(1000); }
+  catch(e){ goHome(false, true); }
 }
-
-function addOrUpdatePlayer(uid, name, connected){
-  let p = S.players.find(p => p.uid === uid);
-  let clean = String(name || 'Joueur').trim().slice(0, 16) || 'Joueur';
-  // évite deux pseudos identiques
-  let base = clean, i = 2;
-  while (S.players.some(o => o.uid !== uid && o.name.toLowerCase() === clean.toLowerCase())) clean = base + ' ' + (i++);
-  if (p){ p.name = clean; p.connected = connected; }
-  else { p = { uid, name: clean, score: 0, connected, host: uid === MY_UID }; S.players.push(p); }
-  return p;
-}
-
-function hostOnMsg(m){
-  const uid = typeof m.uid === 'string' ? m.uid.slice(0, 40) : null;
-  if (!uid || uid === MY_UID) return;
-  lastSeen.set(uid, Date.now());
-  if (S.banned.includes(uid)){ netPub('to/' + uid, { id: rid(), t: 'kicked' }); return; }
-  let p = S.players.find(p => p.uid === uid);
-  if (m.t === 'hello'){
-    if (!p && S.players.length >= 20){ netPub('to/' + uid, { id: rid(), t: 'full' }); return; }
-    const isNew = !p;
-    p = addOrUpdatePlayer(uid, m.name, true);
-    if (isNew) toast(p.name + ' a rejoint la partie');
-    broadcast();
-    return;
-  }
-  if (!p) return;
-  if (!p.connected){ p.connected = true; broadcast(); }
-  if (m.t !== 'ping') handle(uid, m);
-}
-
-// Actions (de l'hôte lui-même ou des joueurs)
-function handle(uid, m){
-  const p = S.players.find(p => p.uid === uid);
-  if (!p) return;
-  switch (m.t){
-    case 'answers':
-      if ((S.phase === 'playing' || S.phase === 'collecting') && m.round === S.round){
-        H.answers[uid] = sanitizeAnswers(m.a);
-        const full = S.settings.categories.every(c => (H.answers[uid][c] || '').trim());
-        H.done = H.done.filter(u => u !== uid); if (full) H.done.push(uid);
-        if (S.doneCount !== H.done.length){ S.doneCount = H.done.length; broadcast(); }
-        if (S.phase === 'collecting' && m.final){ H.collected.add(uid); checkCollected(); }
-      }
-      break;
-    case 'stop':
-      if (S.phase === 'playing' && !S.stoppedBy){
-        S.stoppedBy = p.name;
-        const end = Date.now() + S.settings.stopDelay * 1000;
-        S.endsAt = S.endsAt ? Math.min(S.endsAt, end) : end;
-        broadcast();
-      }
-      break;
-    case 'vote':
-      if (S.phase === 'review' && m.key && !m.key.startsWith(uid + '|')){
-        const arr = S.votes[m.key] || [];
-        const i = arr.indexOf(uid);
-        if (i >= 0) arr.splice(i, 1); else arr.push(uid);
-        S.votes[m.key] = arr;
-        computeResult(); broadcast();
-      }
-      break;
-  }
-}
-function sanitizeAnswers(a){
-  const out = {};
-  if (a && typeof a === 'object') S.settings.categories.forEach(c => { if (typeof a[c] === 'string') out[c] = a[c].slice(0, 40); });
-  return out;
-}
-
-let lastBeat = 0;
-function hostLoop(){
-  if (!S) return;
-  if (S.phase === 'playing' && S.endsAt && Date.now() >= S.endsAt) endPlaying();
-  // joueurs sans nouvelles depuis 15 s = déconnectés
-  let changed = false;
-  S.players.forEach(p => {
-    if (p.uid === MY_UID || !p.connected) return;
-    if (Date.now() - (lastSeen.get(p.uid) || 0) > 15000){ p.connected = false; changed = true; }
-  });
-  // l'hôte renvoie l'état régulièrement (signe de vie + rattrapage pour ceux qui arrivent)
-  if (changed || Date.now() - lastBeat > 5000){ lastBeat = Date.now(); broadcast(); }
-  updateNetbar();
-}
-
-function hostStartRound(){
-  if (!S.settings.categories.length){ toast('Ajoute au moins une catégorie'); return; }
-  const pool = (S.settings.letters === 'all' ? LETTERS_ALL : LETTERS_EASY).split('');
-  let avail = pool.filter(l => !S.usedLetters.includes(l));
-  if (!avail.length){ S.usedLetters = []; avail = pool; }
-  const letter = avail[Math.floor(Math.random() * avail.length)];
-  S.usedLetters.push(letter);
-  S.round++; S.letter = letter; S.phase = 'rolling'; S.stoppedBy = null; S.answers = null; S.votes = {}; S.result = null; S.doneCount = 0;
-  H.answers = {}; H.done = [];
-  broadcast();
-  setTimeout(() => {
-    if (S.phase !== 'rolling') return;
-    S.phase = 'playing';
-    S.endsAt = S.settings.duration ? Date.now() + S.settings.duration * 1000 : 0;
-    broadcast();
-  }, 2600);
-}
-
-function endPlaying(){
-  S.phase = 'collecting';
-  H.collected = new Set();
-  broadcast();
-  // l'hôte envoie ses propres réponses tout de suite
-  handle(MY_UID, { t: 'answers', round: S.round, a: myAnswers, final: true });
-  clearTimeout(collectTimer);
-  collectTimer = setTimeout(toReview, 4000);
-}
-function checkCollected(){
-  const online = S.players.filter(p => p.connected).map(p => p.uid);
-  if (online.every(u => H.collected.has(u))) toReview();
-}
-function toReview(){
-  if (S.phase !== 'collecting') return;
-  clearTimeout(collectTimer);
-  S.answers = {};
-  S.players.forEach(p => { if (H.answers[p.uid] || p.connected) S.answers[p.uid] = H.answers[p.uid] || {}; });
-  S.votes = {};
-  S.phase = 'review';
-  computeResult();
-  broadcast();
-}
-function computeResult(){
-  const uids = Object.keys(S.answers || {});
-  const voters = uids.length - 1;
-  const res = {};
-  uids.forEach(u => res[u] = { cats: {}, total: 0 });
-  S.settings.categories.forEach(cat => {
-    const valid = [];
-    uids.forEach(u => {
-      const w = (S.answers[u][cat] || '').trim();
-      const key = u + '|' + cat;
-      const v = (S.votes[key] || []).length;
-      let status;
-      if (!w) status = 'empty';
-      else if (!startsOk(w, S.letter)) status = 'bad';
-      else if (voters > 0 && v * 2 > voters) status = 'bad';
-      else { status = 'ok'; valid.push({ u, c: canon(w) }); }
-      res[u].cats[cat] = { status, pts: 0 };
-    });
-    valid.forEach(({ u, c }) => {
-      const same = valid.filter(o => o.c === c).length;
-      const r = res[u].cats[cat];
-      if (same > 1){ r.status = 'dup'; r.pts = 5; } else r.pts = 10;
-      res[u].total += r.pts;
-    });
-  });
-  S.result = res;
-}
-function hostValidate(){
-  if (S.phase !== 'review') return;
-  computeResult();
-  S.players.forEach(p => { if (S.result[p.uid]) p.score += S.result[p.uid].total; });
-  S.phase = 'scores';
-  broadcast();
-}
-function hostFinish(){ S.phase = 'end'; broadcast(); }
-function hostReplay(){
-  S.players = S.players.filter(p => p.connected);
-  S.players.forEach(p => p.score = 0);
-  S.round = 0; S.usedLetters = []; S.phase = 'lobby'; S.answers = null; S.result = null; S.votes = {};
-  broadcast();
-}
-function hostKick(uid){
-  const p = S.players.find(p => p.uid === uid);
-  if (!p || uid === MY_UID) return;
-  if (!confirm('Exclure ' + p.name + ' de la partie ?')) return;
-  S.banned.push(uid);
-  S.players = S.players.filter(p => p.uid !== uid);
-  netPub('to/' + uid, { id: rid(), t: 'kicked' });
-  broadcast();
-}
-
-function broadcast(){
-  S.v = (S.v || 0) + 1;
-  netPub('state', { id: rid(), host: MY_UID, v: S.v, s: S, now: Date.now() }, true);
-  if (S.phase === 'end') store.del('pb_host');
-  else store.set('pb_host', { S, H: { answers: H.answers, done: H.done }, t: Date.now() });
-  clockOffset = 0;
-  render();
-}
-
-/* ================= JOUEUR ================= */
-function clientJoin(code){
+async function joinGame(code){
   const name = myName();
   if (!name){ toast('Choisis un pseudo d\'abord'); $('#in-name').focus(); return; }
   code = (code || '').toUpperCase().replace(/[^A-Z]/g, '');
   if (code.length !== 4){ toast('Le code fait 4 lettres'); $('#in-code').focus(); return; }
   store.set('pb_name', name);
-  isHost = false; roomCode = code; leaving = false; S = null; lastV = -1; lastLive = 0;
+  leaving = false; S = null; roomCode = code;
   show('scr-connecting'); $('#connecting-msg').textContent = 'Connexion à la partie ' + code + '…';
-  if (typeof mqtt === 'undefined'){ toast('Impossible de charger le module réseau. Vérifie ta connexion.'); goHome(false); return; }
-  netOpen(code, ['state', 'to/' + MY_UID], (sub, m, retained) => clientOnMsg(sub, m, retained));
-  netReady(() => {
-    sayHello();
-    clearInterval(clientTick);
-    clientTick = setInterval(clientLoop, 2000);
-    clearTimeout(joinTimeout);
-    joinTimeout = setTimeout(() => { if (!S){ toast('Aucune partie trouvée avec le code ' + code + '. Vérifie le code.'); goHome(false); } }, 8000);
-  }, 15000, () => { toast('Impossible de se connecter au serveur de jeu. Vérifie ta connexion internet.'); goHome(false); });
-}
-function sayHello(){ netPub('up', { id: rid(), uid: MY_UID, t: 'hello', name: myName() || store.get('pb_name', 'Joueur') }); }
-function clientLoop(){
-  if (leaving || isHost) return;
-  const inGame = S && S.players.some(p => p.uid === MY_UID);
-  if (!inGame) sayHello(); else netPub('up', { id: rid(), uid: MY_UID, t: 'ping' });
-  updateNetbar();
-}
-function clientOnMsg(sub, m, retained){
-  if (sub === 'state'){
-    if (!m.s || typeof m.v !== 'number') return;
-    if (m.v <= lastV && m.host === (S && S.hostUid)) return; // message en retard
-    clearTimeout(joinTimeout);
-    if (!retained){ clockOffset = Date.now() - m.now; lastLive = Date.now(); }
-    else if (!lastLive) clockOffset = 0;
-    const prev = S ? S.phase : null;
-    lastV = m.v; S = m.s; S.hostUid = m.host;
-    if (S.phase === 'end' && !S.players.some(p => p.uid === MY_UID)) return;
-    if (!S.players.some(p => p.uid === MY_UID)){
-      $('#connecting-msg').textContent = "Partie trouvée ! En attente de l'hôte… (il doit avoir la page du jeu ouverte)";
-      sayHello();
-      return;
-    }
-    if (S.phase === 'collecting' && prev !== 'collecting') sendAnswers(true);
-    render(); updateNetbar();
-  } else if (sub === 'to/' + MY_UID){
-    if (m.t === 'kicked'){ toast('Tu as été exclu de la partie'); goHome(false); }
-    else if (m.t === 'full'){ toast('La partie est complète'); goHome(false); }
+  try{ await api('join', { name }, true); schedulePoll(1000); }
+  catch(e){
+    toast(e.status === 404 ? 'Aucune partie trouvée avec le code ' + code : (e.status ? e.message : 'Impossible de joindre le serveur du jeu. Vérifie ta connexion.'));
+    goHome(false, true);
   }
-}
-function send(m){
-  if (isHost) handle(MY_UID, m);
-  else netPub('up', Object.assign({}, m, { id: rid(), uid: MY_UID }));
 }
 let sendTimer;
 function sendAnswers(final){
   clearTimeout(sendTimer);
-  const doSend = () => send({ t: 'answers', round: S.round, a: myAnswers, final: !!final });
-  if (final) doSend(); else sendTimer = setTimeout(doSend, 350);
+  const doSend = () => api('answers', { round: S.round, a: myAnswers }, true).catch(() => {});
+  if (final) return doSend();
+  sendTimer = setTimeout(doSend, 400);
 }
+function saveSettings(){ render(); api('settings', { settings: S.settings }).catch(() => {}); }
 
-function goHome(confirmIt){
-  if (confirmIt && !confirm(isHost ? 'Quitter ? La partie sera terminée pour tout le monde.' : 'Quitter la partie ?')) return;
+function goHome(confirmIt, silent){
+  if (confirmIt && !confirm('Quitter la partie ?')) return;
+  if (!silent && roomCode && S) api('leave', {}, true).catch(() => {});
   leaving = true;
-  if (isHost){
-    store.del('pb_host');
-    if (S){ S.phase = 'end'; S.v = (S.v || 0) + 1; netPub('state', { id: rid(), host: MY_UID, v: S.v, s: S, now: Date.now() }); netPub('state', null, true); }
-  }
-  clearInterval(hostTick); hostTick = null; clearInterval(clientTick); clientTick = null;
-  clearTimeout(collectTimer); clearTimeout(joinTimeout);
-  const old = netClients; netClients = [];
-  setTimeout(() => old.forEach(c => { try{ c.end(true); }catch(e){} }), 600);
-  S = null; H = null; isHost = false; myRound = -1; lastV = -1; lastLive = 0;
+  store.del('pb_room');
+  clearTimeout(pollTimer); clearTimeout(sendTimer);
+  S = null; roomCode = null; isHost = false; myRound = -1; seen = {}; failCount = 0;
   history.replaceState(null, '', location.pathname);
   updateNetbar();
   initHome();
@@ -721,7 +456,7 @@ function hostNow(){ return Date.now() - clockOffset; }
 function render(){
   if (!S) return;
   const me = S.players.find(p => p.uid === MY_UID);
-  if (!me && !isHost) return;
+  if (!me) return;
   const map = { lobby: 'scr-lobby', rolling: 'scr-play', playing: 'scr-play', collecting: 'scr-play', review: 'scr-review', scores: 'scr-scores', end: 'scr-end' };
   const scr = map[S.phase];
   if (scr !== currentScreen){ show(scr); currentScreen = scr; window.scrollTo(0, 0); }
@@ -731,9 +466,9 @@ function render(){
 function playersHtml(withKick){
   return S.players.map(p => `<li><div class="avatar">${initials(p.name)}</div>
     <span class="name">${esc(p.name)}${p.uid === MY_UID ? ' <span class="muted">(toi)</span>' : ''}</span>
-    ${p.host ? '<span class="tag">hôte</span>' : ''}
-    <span class="dot ${p.connected ? '' : 'off'}" title="${p.connected ? 'connecté' : 'déconnecté'}"></span>
-    ${withKick && !p.host ? `<button class="btn small danger" data-kick="${esc(p.uid)}">Exclure</button>` : ''}</li>`).join('');
+    ${p.uid === S.hostUid ? '<span class="tag">hôte</span>' : ''}
+    <span class="dot ${online(p.uid) ? '' : 'off'}" title="${online(p.uid) ? 'connecté' : 'déconnecté'}"></span>
+    ${withKick && p.uid !== S.hostUid ? `<button class="btn small danger" data-kick="${esc(p.uid)}">Exclure</button>` : ''}</li>`).join('');
 }
 
 function renderLobby(){
@@ -765,8 +500,7 @@ function renderLobby(){
 function renderPlay(){
   $('#play-letter').textContent = S.phase === 'rolling' ? '?' : S.letter;
   $('#play-round').textContent = 'Manche ' + S.round + (S.settings.rounds ? ' / ' + S.settings.rounds : '');
-  const n = S.players.filter(p => p.connected).length;
-  $('#play-done').textContent = S.phase === 'rolling' ? '' : (S.doneCount || 0) + ' / ' + n + ' ont tout rempli';
+  $('#play-done').textContent = S.phase === 'rolling' ? '' : S.players.length + ' joueurs · lettre ' + S.letter;
   const rolling = S.phase === 'rolling';
   $('#rolling').classList.toggle('hidden', !rolling);
   $('#play-area').classList.toggle('hidden', rolling);
@@ -875,14 +609,14 @@ function renderEnd(){
 }
 
 /* ================= Événements ================= */
-$('#btn-create').onclick = () => hostStart(null);
-$('#btn-join').onclick = () => clientJoin($('#in-code').value);
-$('#in-code').addEventListener('keydown', e => { if (e.key === 'Enter') clientJoin($('#in-code').value); });
+$('#btn-create').onclick = () => createGame();
+$('#btn-join').onclick = () => joinGame($('#in-code').value);
+$('#in-code').addEventListener('keydown', e => { if (e.key === 'Enter') joinGame($('#in-code').value); });
 $('#in-code').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, ''); });
-$('#btn-cancel-connect').onclick = () => goHome(false);
+$('#btn-cancel-connect').onclick = () => goHome(false, true);
 $$('[data-leave]').forEach(b => b.onclick = () => goHome(true));
-$('#btn-resume').onclick = () => { const d = store.get('pb_host'); if (d) hostStart(d); };
-$('#btn-forget').onclick = () => { store.del('pb_host'); $('#resume-card').classList.add('hidden'); };
+$('#btn-resume').onclick = () => { const d = store.get('pb_room'); if (d) joinGame(d.code); };
+$('#btn-forget').onclick = () => { store.del('pb_room'); $('#resume-card').classList.add('hidden'); };
 
 function shareLink(){ return location.origin + location.pathname + '?code=' + S.code; }
 $('#btn-copy-code').onclick = async () => { try{ await navigator.clipboard.writeText(S.code); toast('Code copié : ' + S.code); }catch(e){ toast('Code : ' + S.code); } };
@@ -892,61 +626,64 @@ $('#btn-share').onclick = async () => {
   try{ await navigator.clipboard.writeText(url); toast('Lien copié !'); }catch(e){ prompt('Copie ce lien :', url); }
 };
 
-// Catégories (hôte)
+// Catégories et réglages (hôte)
 function addCat(name){
   name = String(name || '').trim().slice(0, 30);
   if (!name) return;
   if (S.settings.categories.some(c => c.toLowerCase() === name.toLowerCase())){ toast('Cette catégorie existe déjà'); return; }
   if (S.settings.categories.length >= 20){ toast('20 catégories maximum'); return; }
-  S.settings.categories.push(name); broadcast();
+  S.settings.categories.push(name); saveSettings();
 }
 $('#btn-addcat').onclick = () => { addCat($('#in-newcat').value); $('#in-newcat').value = ''; $('#in-newcat').focus(); };
 $('#in-newcat').addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); $('#btn-addcat').click(); } });
-$('#btn-cat-default').onclick = () => { S.settings.categories = CLASSIC.slice(); broadcast(); };
-$('#btn-cat-random').onclick = () => { S.settings.categories = shuffle([...CLASSIC, ...SUGGEST]).slice(0, 8); broadcast(); };
+$('#btn-cat-default').onclick = () => { S.settings.categories = CLASSIC.slice(); saveSettings(); };
+$('#btn-cat-random').onclick = () => { S.settings.categories = shuffle([...CLASSIC, ...SUGGEST]).slice(0, 8); saveSettings(); };
 document.addEventListener('click', e => {
   const rm = e.target.closest('[data-rmcat]');
-  if (rm && isHost){ S.settings.categories.splice(+rm.dataset.rmcat, 1); broadcast(); return; }
+  if (rm && isHost){ S.settings.categories.splice(+rm.dataset.rmcat, 1); saveSettings(); return; }
   const add = e.target.closest('[data-addcat]');
   if (add && isHost){ addCat(add.dataset.addcat); return; }
   const kick = e.target.closest('[data-kick]');
-  if (kick && isHost){ hostKick(kick.dataset.kick); return; }
+  if (kick && isHost){
+    const p = S.players.find(p => p.uid === kick.dataset.kick);
+    if (p && confirm('Exclure ' + p.name + ' de la partie ?')) api('kick', { target: p.uid }).catch(() => {});
+    return;
+  }
   const v = e.target.closest('[data-vote]');
-  if (v){ send({ t: 'vote', key: v.dataset.vote }); }
+  if (v) api('vote', { key: v.dataset.vote }).catch(() => {});
 });
 ['duration', 'rounds', 'stopdelay', 'letters'].forEach(k => {
   $('#set-' + k).addEventListener('change', e => {
     const key = { duration: 'duration', rounds: 'rounds', stopdelay: 'stopDelay', letters: 'letters' }[k];
     S.settings[key] = k === 'letters' ? e.target.value : +e.target.value;
-    broadcast();
+    saveSettings();
   });
 });
 
-$('#btn-start').onclick = () => hostStartRound();
-$('#btn-stop').onclick = () => { sendAnswers(true); send({ t: 'stop' }); vibrate(150); };
-$('#btn-validate').onclick = () => hostValidate();
-$('#btn-next').onclick = () => { if (S.settings.rounds && S.round >= S.settings.rounds) hostFinish(); else hostStartRound(); };
-$('#btn-finish').onclick = () => { if (confirm('Terminer la partie maintenant ?')) hostFinish(); };
-$('#btn-replay').onclick = () => hostReplay();
-
-window.addEventListener('beforeunload', e => { if (S && isHost && S.phase !== 'end'){ e.preventDefault(); e.returnValue = ''; } });
+$('#btn-start').onclick = () => api('start').catch(() => {});
+$('#btn-stop').onclick = async () => { vibrate(150); $('#btn-stop').disabled = true; try{ await sendAnswers(true); }catch(e){} api('stop').catch(() => {}); };
+$('#btn-validate').onclick = () => api('validate').catch(() => {});
+$('#btn-next').onclick = () => api('start').catch(() => {});
+$('#btn-finish').onclick = () => { if (confirm('Terminer la partie maintenant ?')) api('finish').catch(() => {}); };
+$('#btn-replay').onclick = () => api('replay').catch(() => {});
 
 /* ================= Démarrage ================= */
 function initHome(){
   currentScreen = ''; show('scr-home');
   $('#in-name').value = store.get('pb_name', '') || '';
-  const d = store.get('pb_host');
-  if (d && d.S && Date.now() - d.t < 6 * 3600 * 1000 && d.S.phase !== 'end'){
-    $('#resume-code').textContent = d.S.code; $('#resume-card').classList.remove('hidden');
-  } else { $('#resume-card').classList.add('hidden'); if (d) store.del('pb_host'); }
+  const d = store.get('pb_room');
+  if (d && d.code && Date.now() - d.t < 6 * 3600 * 1000){
+    $('#resume-code').textContent = d.code; $('#resume-card').classList.remove('hidden');
+  } else { $('#resume-card').classList.add('hidden'); if (d) store.del('pb_room'); }
 }
 initHome();
 const urlCode = new URLSearchParams(location.search).get('code');
 if (urlCode){
   $('#in-code').value = urlCode.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
-  if (myName()) clientJoin($('#in-code').value);
+  if (myName()) joinGame($('#in-code').value);
   else { $('#in-name').focus(); toast('Choisis ton pseudo puis appuie sur Rejoindre'); }
 }
 </script>
+
 </body>
 </html>
