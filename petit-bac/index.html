@@ -80,7 +80,8 @@ input:disabled{opacity:.6}
 .ans.empty .word{color:var(--muted);font-weight:400;font-style:italic}
 .pts{font-weight:800;min-width:38px;text-align:right}
 .pts.ok{color:var(--ok)} .pts.dup{color:var(--dup)} .pts.bad{color:var(--bad)}
-.votes{font-size:.75rem;color:var(--bad)}
+.votes{display:block;font-size:.75rem;font-weight:600;color:var(--bad);text-decoration:none;margin-top:2px}
+.ans.bad .word .votes{text-decoration:none}
 .ans.voted{border-color:var(--bad)}
 table{width:100%;border-collapse:collapse}
 th,td{padding:8px 6px;text-align:left;border-bottom:1px solid var(--line)}
@@ -810,7 +811,7 @@ function renderReview(){
       const cls = r.status === 'empty' ? 'empty' : (r.status === 'bad' ? 'bad' : '');
       return `<div class="ans ${cls} ${canVote ? 'clickable' : ''} ${mine ? 'voted' : ''}" ${canVote ? `data-vote="${esc(key)}"` : ''}>
         <span class="who">${esc(name(u))}</span>
-        <span class="word">${w ? esc(w) : '—'}${votes.length ? ` <span class="votes">👎 ${votes.length}</span>` : ''}</span>
+        <span class="word">${w ? esc(w) : '—'}${votes.length ? `<span class="votes">👎 contesté par ${votes.map(v => v === MY_UID ? 'toi' : esc(name(v))).join(', ')}</span>` : ''}</span>
         <span class="pts ${r.status === 'dup' ? 'dup' : r.status === 'ok' ? 'ok' : 'bad'}">${r.pts}</span></div>`;
     }).join('')}</div>`).join('');
   $('#review-host').classList.toggle('hidden', !isHost);
