@@ -138,6 +138,7 @@ a{color:var(--accent2)}
     <div class="spacer"></div>
     <button class="btn blue full" id="btn-join">Rejoindre</button>
   </div>
+  <p class="muted" id="net-status" style="text-align:center"></p>
 
   <div class="card">
     <h2>Règles</h2>
@@ -146,7 +147,7 @@ a{color:var(--accent2)}
       <li>Trouve un mot qui commence par cette lettre pour chaque catégorie.</li>
       <li>Quand tu as tout rempli, appuie sur <b>STOP</b> : les autres ont quelques secondes pour finir.</li>
       <li>Mot unique : <b style="color:var(--ok)">10 pts</b> · Même mot qu'un autre : <b style="color:var(--dup)">5 pts</b> · Vide ou refusé : <b style="color:var(--bad)">0</b>.</li>
-      <li>Si l'hôte s'en va, un autre joueur prend le relais automatiquement.</li>
+      <li>Personne n'est obligé de rester sur la page : si l'hôte s'en va, un autre joueur prend le relais.</li>
       <li>Pendant la correction, touche un mot pour le contester. Refusé si la majorité des autres joueurs le conteste.</li>
     </ul>
   </div>
@@ -288,6 +289,8 @@ a{color:var(--accent2)}
 <div id="toast" class="toast hidden"></div>
 <div id="netbar" class="netbar hidden"></div>
 
+<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
+<script>window.mqtt || document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js"><\/script>')</script>
 <script>
 "use strict";
 /* ================= Utilitaires ================= */
@@ -339,119 +342,352 @@ function shuffle(a){ a = a.slice(); for (let i = a.length - 1; i > 0; i--){ cons
 function initials(n){ return esc((n || '?').trim().charAt(0).toUpperCase()); }
 function vibrate(p){ try{ navigator.vibrate && navigator.vibrate(p); }catch(e){} }
 
-/* ================= Réseau (serveur Vercel + base de données Redis) ================= */
-// Le serveur garde la partie : personne n'a besoin de laisser sa page ouverte.
-const API = (location.hostname.endsWith('github.io') ? 'https://nathan06560-github-io.vercel.app' : '') + '/api/petitbac';
-let isHost = false, roomCode = null;
-let S = null;            // état de la partie (vient du serveur)
-let seen = {};           // dernière activité de chaque joueur (heure serveur)
-let clockOffset = 0;     // Date.now() local - heure serveur
-let myAnswers = {}, myRound = -1, myAnswersRound = -1;
-let pollTimer = null, pollCount = 0, failCount = 0, leaving = false, storageWarned = false;
+/* ================= Réseau : relais MQTT publics, aucun serveur ni compte nécessaire ================= */
+// La partie n'est pas gardée par un téléphone : chaque info est un message « retenu » sur les relais
+// (la partie, chaque joueur, chaque copie, chaque STOP, chaque vote). Chaque téléphone recalcule
+// tout seul le chrono et les points. Si l'hôte disparaît, le joueur suivant devient hôte.
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const TOPIC = 'petitbac-n06560/v3/';
+const ROLL_MS = 2600, COLLECT_MS = 3000, ONLINE_MS = 16000, BEAT_MS = 5000, MAX_PLAYERS = 20;
+let roomCode = null, isHost = false, leaving = false;
+let S = null;                                  // vue calculée, utilisée par l'affichage
+let G = null, P = {}, A = {}, STOPS = {}, VOTES = {}, OFF = {};
+let netClients = [];
+let myAnswers = {}, myRound = -1, myAnswersRound = -1, myVotes = {}, myJoinedAt = 0;
+let sessionStart = 0, beatTimer = null, tickTimer = null, joinTimer = null, lastKey = '', lastPhase = '', updTimer = null;
 
-function myName(){ return ($('#in-name').value || '').trim().slice(0, 16); }
-function online(uid){ return Date.now() - clockOffset - (+seen[uid] || 0) < 15000; }
+function myName(){ return ($('#in-name').value || '').trim().slice(0, 16) || store.get('pb_name', '') || 'Joueur'; }
+function isOnline(uid){ if (uid === MY_UID) return true; const p = P[uid]; return !!p && Date.now() - p.seenAt < ONLINE_MS; }
+const online = isOnline;
+function toLocal(uid, t){ return t + (uid === MY_UID ? 0 : (OFF[uid] || 0)); }
 
-async function api(action, data, quiet){
-  const body = Object.assign({ action, uid: MY_UID, code: roomCode }, data || {});
-  let r, j;
-  try{
-    r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    j = await r.json();
-  }catch(e){
-    failCount++; updateNetbar();
-    if (!quiet) toast('Impossible de joindre le serveur du jeu. Vérifie ta connexion.');
-    throw e;
-  }
-  failCount = 0; updateNetbar();
-  if (j.now) clockOffset = Date.now() - j.now;
-  if (j.storage === 'memory' && !storageWarned && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)){
-    storageWarned = true; toast('⚠️ La base de données n\'est pas encore connectée sur Vercel', 7000);
-  }
-  if (j.seen) seen = j.seen;
-  if (!r.ok){ const err = new Error(j.error || 'Erreur'); err.status = r.status; if (!quiet) toast(err.message); throw err; }
-  if (j.state) applyState(j.state);
-  else if (j.seen && S) render();
-  return j;
+function netOpen(code){
+  netClose();
+  const base = TOPIC + code + '/';
+  netClients = BROKERS.map(url => {
+    const c = mqtt.connect(url, { clientId: 'pb_' + Math.random().toString(36).slice(2, 12), clean: true, connectTimeout: 10000, reconnectPeriod: 2000, keepalive: 30 });
+    c.on('connect', () => { c.subscribe(base + '#', { qos: 0 }); updateNetbar(); });
+    c.on('message', (topic, payload, packet) => {
+      if (topic.indexOf(base) !== 0) return;
+      let m = null;
+      if (payload && payload.length){ try{ m = JSON.parse(payload.toString()); }catch(e){ return; } }
+      onMsg(topic.slice(base.length), m, !!packet.retain);
+    });
+    ['close', 'offline'].forEach(ev => c.on(ev, updateNetbar));
+    c.on('error', () => {});
+    return c;
+  });
 }
-function applyState(s){
-  if (S && s.code === S.code && s.v < S.v) return; // réponse en retard
-  const prev = S ? S.phase : null, wasHost = isHost;
-  S = s; roomCode = s.code;
+function netPub(sub, obj){
+  const t = TOPIC + roomCode + '/' + sub;
+  const payload = obj == null ? '' : JSON.stringify(Object.assign({}, obj, { from: MY_UID, sentAt: Date.now() }));
+  netClients.forEach(c => { if (c.connected) try{ c.publish(t, payload, { qos: 0, retain: true }); }catch(e){} });
+}
+function netConnected(){ return netClients.some(c => c.connected); }
+function netClose(){ const old = netClients; netClients = []; setTimeout(() => old.forEach(c => { try{ c.end(true); }catch(e){} }), 700); }
+function waitConnected(timeoutMs){
+  return new Promise((ok, ko) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (leaving){ clearInterval(iv); ko(new Error('annulé')); }
+      else if (netConnected()){ clearInterval(iv); ok(); }
+      else if (Date.now() - t0 > timeoutMs){ clearInterval(iv); ko(new Error('réseau')); }
+    }, 100);
+  });
+}
+
+function onMsg(sub, m, retained){
+  const parts = sub.split('/');
+  if (m && m.from && !retained && m.from !== MY_UID){
+    const off = Date.now() - m.sentAt; // décalage d'horloge (+ latence) de l'expéditeur
+    OFF[m.from] = OFF[m.from] === undefined ? off : Math.min(OFF[m.from], off);
+  }
+  if (parts[0] === 'game'){
+    if (m && (!G || m.v > G.v || (m.v === G.v && m.sentAt > G.sentAt))) G = m;
+  } else if (parts[0] === 'p' && parts[1]){
+    if (!m) delete P[parts[1]];
+    else if (m.uid === parts[1]){ m.seenAt = retained ? m.sentAt : Date.now(); if (!P[m.uid] || m.sentAt >= P[m.uid].sentAt) P[m.uid] = m; }
+  } else if (parts[0] === 'a' && parts[2] && m){
+    (A[parts[1]] = A[parts[1]] || {})[parts[2]] = m.a || {};
+  } else if (parts[0] === 'stop' && m){
+    const cur = STOPS[parts[1]];
+    if (!cur || toLocal(m.from, m.at) < toLocal(cur.from, cur.at)) STOPS[parts[1]] = m;
+  } else if (parts[0] === 'vote' && parts[2] && m){
+    (VOTES[parts[1]] = VOTES[parts[1]] || {})[parts[2]] = Array.isArray(m.keys) ? m.keys : [];
+  }
+  clearTimeout(updTimer); updTimer = setTimeout(update, 40);
+}
+
+/* ---------- Calcul de l'état ---------- */
+function computeResult(s){
+  const uids = Object.keys(s.answers || {});
+  const voters = uids.length - 1;
+  const res = {};
+  uids.forEach(u => res[u] = { cats: {}, total: 0 });
+  s.settings.categories.forEach(cat => {
+    const valid = [];
+    uids.forEach(u => {
+      const w = String(s.answers[u][cat] || '').trim();
+      const v = (s.votes[u + '|' + cat] || []).length;
+      let status;
+      if (!w) status = 'empty';
+      else if (!startsOk(w, s.letter)) status = 'bad';
+      else if (voters > 0 && v * 2 > voters) status = 'bad';
+      else { status = 'ok'; valid.push({ u, c: canon(w) }); }
+      res[u].cats[cat] = { status, pts: 0 };
+    });
+    valid.forEach(({ u, c }) => {
+      const r = res[u].cats[cat];
+      if (valid.filter(o => o.c === c).length > 1){ r.status = 'dup'; r.pts = 5; } else r.pts = 10;
+      res[u].total += r.pts;
+    });
+  });
+  s.result = res;
+}
+function derive(){
+  if (!G) return null;
+  const now = Date.now(), banned = G.banned || [], scores = G.scores || {};
+  const players = Object.values(P).filter(p => p && p.uid && !banned.includes(p.uid))
+    .sort((a, b) => (a.joinedAt - b.joinedAt) || (a.uid < b.uid ? -1 : 1)).slice(0, MAX_PLAYERS)
+    .map(p => ({ uid: p.uid, name: String(p.name || 'Joueur').slice(0, 16), score: scores[p.uid] || 0 }));
+  // pseudos en double -> on numérote
+  const count = {}; players.forEach(p => { const k = p.name.toLowerCase(); count[k] = (count[k] || 0) + 1; if (count[k] > 1) p.name += ' ' + count[k]; });
+  let host = G.hostUid;
+  if (!players.some(p => p.uid === host) || !isOnline(host)){ const o = players.find(p => isOnline(p.uid)); if (o) host = o.uid; }
+  const s = { code: roomCode, v: G.v, hostUid: host, players, settings: G.settings, round: G.round, letter: G.letter,
+    phase: G.phase, endsAt: 0, stoppedBy: null, answers: null, votes: {}, result: null, lastRound: G.lastRound };
+  if (G.phase === 'round'){
+    const R = toLocal(G.startBy, G.startAt) + ROLL_MS;
+    s.rollUntil = R;
+    let end = G.settings.duration ? R + G.settings.duration * 1000 : 0;
+    const st = STOPS[G.round];
+    if (st){
+      const p = players.find(p => p.uid === st.from);
+      s.stoppedBy = p ? p.name : (st.name || '?');
+      const se = Math.max(R, toLocal(st.from, st.at)) + G.settings.stopDelay * 1000;
+      end = end ? Math.min(end, se) : se;
+    }
+    s.endsAt = end;
+    if (now < R) s.phase = 'rolling';
+    else if (!end || now < end) s.phase = 'playing';
+    else if (now < end + COLLECT_MS) s.phase = 'collecting';
+    else {
+      s.phase = 'review';
+      const ans = A[G.round] || {};
+      s.answers = {};
+      players.forEach(p => { if (ans[p.uid] || isOnline(p.uid)) s.answers[p.uid] = ans[p.uid] || {}; });
+      const vr = VOTES[G.round] || {};
+      Object.keys(vr).forEach(voter => {
+        if (!s.answers[voter]) return;
+        vr[voter].forEach(key => { if (!key.startsWith(voter + '|')) (s.votes[key] = s.votes[key] || []).push(voter); });
+      });
+      computeResult(s);
+    }
+  }
+  return s;
+}
+function update(){
+  if (!G || leaving) return;
+  if ((G.banned || []).includes(MY_UID)){ toast('Tu as été exclu de la partie'); goHome(false, true); return; }
+  const prevHost = isHost, prevPhase = lastPhase;
+  S = derive();
+  if (!S) return;
   isHost = S.hostUid === MY_UID;
-  if (!S.players.some(p => p.uid === MY_UID)){ toast('Tu ne fais plus partie de cette partie'); goHome(false, true); return; }
-  if (prev && !wasHost && isHost) toast('Tu es maintenant l\'hôte de la partie');
-  store.set('pb_room', { code: S.code, t: Date.now() });
-  if (S.phase === 'collecting' && prev !== 'collecting') sendAnswers(true);
-  render();
+  // si je deviens hôte (l'ancien a disparu), je le note dans la partie
+  if (isHost && G.hostUid !== MY_UID && Date.now() - sessionStart > 8000) pubGame();
+  if (prevHost === false && isHost && prevPhase) toast('Tu es maintenant l\'hôte de la partie');
+  if (S.phase === 'collecting' && prevPhase === 'playing') sendAnswers(true);
+  lastPhase = S.phase;
+  lastKey = S.phase + '|' + S.round + '|' + S.hostUid;
+  if (!S.players.some(p => p.uid === MY_UID)){
+    show('scr-connecting'); currentScreen = '';
+    $('#connecting-msg').textContent = 'Connexion à la partie ' + roomCode + '…';
+    return;
+  }
+  render(); updateNetbar();
 }
-function schedulePoll(ms){ clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
-async function poll(){
-  if (leaving || !roomCode) return;
-  const fast = S && ['rolling', 'playing', 'collecting'].includes(S.phase);
-  pollCount++;
-  const beat = pollCount % (fast ? 4 : 3) === 1;
-  const now = Date.now() - clockOffset;
-  const due = S && ((S.phase === 'rolling' && now >= S.rollUntil) || (S.phase === 'playing' && S.endsAt && now >= S.endsAt) || S.phase === 'collecting');
-  try{ await api('poll', { v: S ? S.v : 0, beat, host: S ? S.hostUid : undefined, phase: due ? S.phase : undefined }, true); }
-  catch(e){ if (e.status === 404){ toast('Cette partie est terminée ou a expiré'); goHome(false, true); return; } }
-  if (!leaving && roomCode) schedulePoll(document.hidden ? 4000 : fast ? 1000 : 1500);
+function tick(){
+  if (!G || leaving) return;
+  const s = derive();
+  if (s && s.phase + '|' + s.round + '|' + s.hostUid !== lastKey) update();
+  updateNetbar();
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden && roomCode) schedulePoll(0); });
 function updateNetbar(){
   const bar = $('#netbar'); if (!bar) return;
-  const msg = S && failCount >= 2 ? 'Connexion au serveur perdue… nouvel essai' : '';
+  const msg = roomCode && netClients.length && !netConnected() ? 'Connexion perdue… reconnexion en cours' : '';
   bar.textContent = msg; bar.classList.toggle('hidden', !msg);
 }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  netClients.forEach(c => { if (!c.connected) try{ c.reconnect(); }catch(e){} });
+  if (roomCode) setTimeout(beat, 500);
+});
+
+/* ---------- Publications ---------- */
+function beat(){
+  if (!roomCode || leaving) return;
+  const me = { uid: MY_UID, name: myName(), joinedAt: myJoinedAt };
+  netPub('p/' + MY_UID, me);
+  P[MY_UID] = Object.assign(me, { from: MY_UID, sentAt: Date.now(), seenAt: Date.now() });
+}
+function pubGame(){
+  G.v = (G.v || 0) + 1; G.hostUid = MY_UID;
+  netPub('game', G);
+  G.from = MY_UID; G.sentAt = Date.now();
+  update();
+}
+let settingsTimer;
+function saveSettings(){ render(); clearTimeout(settingsTimer); settingsTimer = setTimeout(() => { if (isHost) pubGame(); }, 250); }
+let sendTimer;
+function sendAnswers(final){
+  clearTimeout(sendTimer);
+  const r = S ? S.round : 0;
+  const doSend = () => { netPub('a/' + r + '/' + MY_UID, { a: myAnswers }); (A[r] = A[r] || {})[MY_UID] = Object.assign({}, myAnswers); };
+  if (final) doSend(); else sendTimer = setTimeout(doSend, 400);
+}
+function toggleVote(key){
+  const r = S.round, list = myVotes[r] = myVotes[r] || ((VOTES[r] || {})[MY_UID] || []).slice();
+  const i = list.indexOf(key); if (i >= 0) list.splice(i, 1); else list.push(key);
+  (VOTES[r] = VOTES[r] || {})[MY_UID] = list.slice();
+  netPub('vote/' + r + '/' + MY_UID, { keys: list });
+  update();
+}
+function sayStop(){
+  if (!S || S.phase !== 'playing' || S.stoppedBy) return;
+  sendAnswers(true);
+  const m = { at: Date.now(), name: myName() };
+  STOPS[S.round] = Object.assign({ from: MY_UID }, m);
+  netPub('stop/' + S.round, m);
+  update();
+}
+
+/* ---------- Actions de l'hôte ---------- */
+function hostStartRound(){
+  if (!isHost) return;
+  if (S.phase === 'scores' && G.settings.rounds && G.round >= G.settings.rounds){ G.phase = 'end'; pubGame(); return; }
+  if (!G.settings.categories.length){ toast('Ajoute au moins une catégorie'); return; }
+  const pool = (G.settings.letters === 'all' ? LETTERS_ALL : LETTERS_EASY).split('');
+  let avail = pool.filter(l => !(G.usedLetters || []).includes(l));
+  if (!avail.length){ G.usedLetters = []; avail = pool; }
+  const letter = avail[Math.floor(Math.random() * avail.length)];
+  G.usedLetters = (G.usedLetters || []).concat(letter);
+  G.round++; G.letter = letter; G.phase = 'round'; G.startAt = Date.now(); G.startBy = MY_UID;
+  pubGame();
+}
+function hostValidate(){
+  if (!isHost || S.phase !== 'review') return;
+  const totals = {};
+  G.scores = G.scores || {};
+  Object.keys(S.result).forEach(u => { totals[u] = S.result[u].total; G.scores[u] = (G.scores[u] || 0) + S.result[u].total; });
+  G.lastRound = { round: G.round, letter: G.letter, totals };
+  G.phase = 'scores';
+  pubGame();
+}
+function hostFinish(){ if (isHost){ G.phase = 'end'; pubGame(); } }
+function hostReplay(){ if (isHost){ G.scores = {}; G.round = 0; G.usedLetters = []; G.lastRound = null; G.phase = 'lobby'; pubGame(); } }
+function hostKick(uid){
+  if (!isHost || uid === MY_UID) return;
+  G.banned = (G.banned || []).concat(uid);
+  netPub('p/' + uid, null);
+  pubGame();
+}
+
+/* ---------- Créer / rejoindre / quitter ---------- */
+function startSession(){
+  sessionStart = Date.now();
+  clearInterval(beatTimer); beatTimer = setInterval(beat, BEAT_MS);
+  clearInterval(tickTimer); tickTimer = setInterval(tick, 250);
+  store.set('pb_room', { code: roomCode, joinedAt: myJoinedAt, t: Date.now() });
+  beat(); update();
+}
+function resetLocal(){ G = null; P = {}; A = {}; STOPS = {}; VOTES = {}; OFF = {}; S = null; myVotes = {}; lastKey = ''; lastPhase = ''; isHost = false; }
+function netMissing(){ toast('Le module réseau ne s\'est pas chargé. Vérifie ta connexion internet puis recharge la page.', 6000); goHome(false, true); }
 
 async function createGame(){
-  const name = myName();
+  const name = ($('#in-name').value || '').trim();
   if (!name){ toast('Choisis un pseudo d\'abord'); $('#in-name').focus(); return; }
   store.set('pb_name', name);
-  leaving = false; S = null; roomCode = null;
+  if (typeof mqtt === 'undefined') return netMissing();
+  leaving = false; resetLocal();
   show('scr-connecting'); $('#connecting-msg').textContent = 'Création de la partie…';
-  try{ await api('create', { name }); schedulePoll(1000); }
-  catch(e){ goHome(false, true); }
+  for (let tries = 0; tries < 5; tries++){
+    roomCode = ''; for (let i = 0; i < 4; i++) roomCode += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+    netOpen(roomCode);
+    try{ await waitConnected(15000); }
+    catch(e){ if (!leaving){ toast('Impossible de joindre le serveur de jeu. Essaie en Wi-Fi ou en 4G, puis réessaie.', 6000); goHome(false, true); } return; }
+    await new Promise(r => setTimeout(r, 1200)); // ce code est-il déjà utilisé ?
+    if (leaving) return;
+    if (G && G.phase !== 'end' && Date.now() - G.sentAt < 6 * 3600e3){ resetLocal(); continue; }
+    resetLocal();
+    myJoinedAt = Date.now();
+    G = { v: 0, hostUid: MY_UID, phase: 'lobby', round: 0, letter: '', usedLetters: [], scores: {}, banned: [], lastRound: null,
+      settings: { categories: CLASSIC.slice(), duration: 120, rounds: 5, stopDelay: 10, letters: 'easy' } };
+    pubGame();
+    startSession();
+    return;
+  }
+  toast('Impossible de créer la partie, réessaie'); goHome(false, true);
 }
 async function joinGame(code){
-  const name = myName();
+  const name = ($('#in-name').value || '').trim();
   if (!name){ toast('Choisis un pseudo d\'abord'); $('#in-name').focus(); return; }
   code = (code || '').toUpperCase().replace(/[^A-Z]/g, '');
   if (code.length !== 4){ toast('Le code fait 4 lettres'); $('#in-code').focus(); return; }
   store.set('pb_name', name);
-  leaving = false; S = null; roomCode = code;
+  if (typeof mqtt === 'undefined') return netMissing();
+  leaving = false; resetLocal(); roomCode = code;
   show('scr-connecting'); $('#connecting-msg').textContent = 'Connexion à la partie ' + code + '…';
-  try{ await api('join', { name }, true); schedulePoll(1000); }
-  catch(e){
-    toast(e.status === 404 ? 'Aucune partie trouvée avec le code ' + code : (e.status ? e.message : 'Impossible de joindre le serveur du jeu. Vérifie ta connexion.'));
-    goHome(false, true);
-  }
+  netOpen(code);
+  try{ await waitConnected(15000); }
+  catch(e){ if (!leaving){ toast('Impossible de joindre le serveur de jeu. Essaie en Wi-Fi ou en 4G, puis réessaie.', 6000); goHome(false, true); } return; }
+  // on attend de recevoir la partie
+  const t0 = Date.now();
+  while (!G && Date.now() - t0 < 8000 && !leaving) await new Promise(r => setTimeout(r, 150));
+  if (leaving) return;
+  if (!G){ toast('Aucune partie trouvée avec le code ' + code + '. Vérifie le code.', 5000); goHome(false, true); return; }
+  if ((G.banned || []).includes(MY_UID)){ toast('Tu as été exclu de cette partie'); goHome(false, true); return; }
+  const saved = store.get('pb_room');
+  myJoinedAt = (P[MY_UID] && P[MY_UID].joinedAt) || (saved && saved.code === code && saved.joinedAt) || Date.now();
+  const n = Object.values(P).filter(p => p && !(G.banned || []).includes(p.uid) && p.uid !== MY_UID).length;
+  if (n >= MAX_PLAYERS && !P[MY_UID]){ toast('La partie est complète'); goHome(false, true); return; }
+  startSession();
 }
-let sendTimer;
-function sendAnswers(final){
-  clearTimeout(sendTimer);
-  const doSend = () => api('answers', { round: S.round, a: myAnswers }, true).catch(() => {});
-  if (final) return doSend();
-  sendTimer = setTimeout(doSend, 400);
-}
-function saveSettings(){ render(); api('settings', { settings: S.settings }).catch(() => {}); }
 
 function goHome(confirmIt, silent){
   if (confirmIt && !confirm('Quitter la partie ?')) return;
-  if (!silent && roomCode && S) api('leave', {}, true).catch(() => {});
+  if (!silent && roomCode && G){
+    netPub('p/' + MY_UID, null);
+    if (isHost && S){ const next = S.players.find(p => p.uid !== MY_UID && isOnline(p.uid)); if (next){ G.v++; G.hostUid = next.uid; netPub('game', G); } }
+  }
   leaving = true;
   store.del('pb_room');
-  clearTimeout(pollTimer); clearTimeout(sendTimer);
-  S = null; roomCode = null; isHost = false; myRound = -1; seen = {}; failCount = 0;
+  clearInterval(beatTimer); clearInterval(tickTimer); clearTimeout(sendTimer); clearTimeout(settingsTimer);
+  netClose();
+  resetLocal(); roomCode = null; myRound = -1;
   history.replaceState(null, '', location.pathname);
   updateNetbar();
   initHome();
 }
 
+/* ---------- Test de connexion affiché sur l'accueil ---------- */
+function probeNetwork(){
+  const el = $('#net-status'); if (!el) return;
+  if (typeof mqtt === 'undefined'){ el.innerHTML = '❌ Module réseau non chargé : vérifie ta connexion puis recharge la page'; return; }
+  el.textContent = '⏳ Test de connexion au serveur de jeu…';
+  let done = false;
+  const cs = BROKERS.map(url => {
+    const c = mqtt.connect(url, { clientId: 'pbprobe_' + Math.random().toString(36).slice(2, 10), connectTimeout: 8000, reconnectPeriod: 0 });
+    c.on('connect', () => { if (!done){ done = true; el.textContent = '✅ Serveur de jeu joignable'; } setTimeout(() => cs.forEach(x => { try{ x.end(true); }catch(e){} }), 300); });
+    c.on('error', () => {});
+    return c;
+  });
+  setTimeout(() => { if (!done){ el.textContent = '❌ Serveur de jeu injoignable depuis ce réseau (essaie en 4G ou un autre Wi-Fi)'; cs.forEach(x => { try{ x.end(true); }catch(e){} }); } }, 10000);
+}
+
 
 /* ================= AFFICHAGE ================= */
 let currentScreen = '', rollAnim = null;
-function hostNow(){ return Date.now() - clockOffset; }
+function hostNow(){ return Date.now(); }
 
 function render(){
   if (!S) return;
@@ -589,9 +825,10 @@ function rankingTable(){
 function renderScores(){
   const last = S.settings.rounds && S.round >= S.settings.rounds;
   $('#scores-title').textContent = 'Scores · manche ' + S.round + (S.settings.rounds ? ' / ' + S.settings.rounds : '');
-  const rows = Object.keys(S.result || {}).map(u => ({ u, pts: S.result[u].total, name: (S.players.find(p => p.uid === u) || { name: '?' }).name }))
+  const tot = (S.lastRound && S.lastRound.totals) || {};
+  const rows = Object.keys(tot).map(u => ({ u, pts: tot[u], name: (S.players.find(p => p.uid === u) || { name: '(parti)' }).name }))
     .sort((a, b) => b.pts - a.pts);
-  $('#scores-round').innerHTML = `<table><tr><th>Joueur</th><th class="num">Lettre ${esc(S.letter)}</th></tr>${rows.map(r =>
+  $('#scores-round').innerHTML = `<table><tr><th>Joueur</th><th class="num">Lettre ${esc(S.lastRound ? S.lastRound.letter : S.letter)}</th></tr>${rows.map(r =>
     `<tr><td>${esc(r.name)}</td><td class="num">+${r.pts}</td></tr>`).join('')}</table>`;
   $('#scores-total').innerHTML = rankingTable();
   $('#scores-host').classList.toggle('hidden', !isHost);
@@ -632,40 +869,40 @@ function addCat(name){
   if (!name) return;
   if (S.settings.categories.some(c => c.toLowerCase() === name.toLowerCase())){ toast('Cette catégorie existe déjà'); return; }
   if (S.settings.categories.length >= 20){ toast('20 catégories maximum'); return; }
-  S.settings.categories.push(name); saveSettings();
+  G.settings.categories.push(name); saveSettings();
 }
 $('#btn-addcat').onclick = () => { addCat($('#in-newcat').value); $('#in-newcat').value = ''; $('#in-newcat').focus(); };
 $('#in-newcat').addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); $('#btn-addcat').click(); } });
-$('#btn-cat-default').onclick = () => { S.settings.categories = CLASSIC.slice(); saveSettings(); };
-$('#btn-cat-random').onclick = () => { S.settings.categories = shuffle([...CLASSIC, ...SUGGEST]).slice(0, 8); saveSettings(); };
+$('#btn-cat-default').onclick = () => { G.settings.categories = CLASSIC.slice(); saveSettings(); };
+$('#btn-cat-random').onclick = () => { G.settings.categories = shuffle([...CLASSIC, ...SUGGEST]).slice(0, 8); saveSettings(); };
 document.addEventListener('click', e => {
   const rm = e.target.closest('[data-rmcat]');
-  if (rm && isHost){ S.settings.categories.splice(+rm.dataset.rmcat, 1); saveSettings(); return; }
+  if (rm && isHost){ G.settings.categories.splice(+rm.dataset.rmcat, 1); saveSettings(); return; }
   const add = e.target.closest('[data-addcat]');
   if (add && isHost){ addCat(add.dataset.addcat); return; }
   const kick = e.target.closest('[data-kick]');
   if (kick && isHost){
     const p = S.players.find(p => p.uid === kick.dataset.kick);
-    if (p && confirm('Exclure ' + p.name + ' de la partie ?')) api('kick', { target: p.uid }).catch(() => {});
+    if (p && confirm('Exclure ' + p.name + ' de la partie ?')) hostKick(p.uid);
     return;
   }
   const v = e.target.closest('[data-vote]');
-  if (v) api('vote', { key: v.dataset.vote }).catch(() => {});
+  if (v) toggleVote(v.dataset.vote);
 });
 ['duration', 'rounds', 'stopdelay', 'letters'].forEach(k => {
   $('#set-' + k).addEventListener('change', e => {
     const key = { duration: 'duration', rounds: 'rounds', stopdelay: 'stopDelay', letters: 'letters' }[k];
-    S.settings[key] = k === 'letters' ? e.target.value : +e.target.value;
+    G.settings[key] = k === 'letters' ? e.target.value : +e.target.value;
     saveSettings();
   });
 });
 
-$('#btn-start').onclick = () => api('start').catch(() => {});
-$('#btn-stop').onclick = async () => { vibrate(150); $('#btn-stop').disabled = true; try{ await sendAnswers(true); }catch(e){} api('stop').catch(() => {}); };
-$('#btn-validate').onclick = () => api('validate').catch(() => {});
-$('#btn-next').onclick = () => api('start').catch(() => {});
-$('#btn-finish').onclick = () => { if (confirm('Terminer la partie maintenant ?')) api('finish').catch(() => {}); };
-$('#btn-replay').onclick = () => api('replay').catch(() => {});
+$('#btn-start').onclick = () => hostStartRound();
+$('#btn-stop').onclick = () => { vibrate(150); sayStop(); };
+$('#btn-validate').onclick = () => hostValidate();
+$('#btn-next').onclick = () => hostStartRound();
+$('#btn-finish').onclick = () => { if (confirm('Terminer la partie maintenant ?')) hostFinish(); };
+$('#btn-replay').onclick = () => hostReplay();
 
 /* ================= Démarrage ================= */
 function initHome(){
@@ -677,10 +914,11 @@ function initHome(){
   } else { $('#resume-card').classList.add('hidden'); if (d) store.del('pb_room'); }
 }
 initHome();
+probeNetwork();
 const urlCode = new URLSearchParams(location.search).get('code');
 if (urlCode){
   $('#in-code').value = urlCode.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
-  if (myName()) joinGame($('#in-code').value);
+  if (($('#in-name').value || '').trim()) joinGame($('#in-code').value);
   else { $('#in-name').focus(); toast('Choisis ton pseudo puis appuie sur Rejoindre'); }
 }
 </script>
